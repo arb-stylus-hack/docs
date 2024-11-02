@@ -202,6 +202,356 @@ impl WageringContract {
 }
 ```
 
+### 4. Badge NFT Contract
+```rust
+use stylus_sdk::{prelude::*, erc::erc721::*};
+
+#[derive(Debug, Encode, Decode, TypeInfo)]
+pub struct Badge {
+    pub badge_type: BadgeType,
+    pub metadata_uri: String,
+    pub earned_timestamp: u64,
+    pub rarity: BadgeRarity,
+}
+
+#[derive(Debug, Encode, Decode, TypeInfo)]
+pub enum BadgeType {
+    Achievement(String),    // Achievement name
+    Streak(u32),           // Streak days
+    Ranking(String),       // Rank level
+    Tournament(String),    // Tournament name
+    Special(String),       // Special event name
+}
+
+#[derive(Debug, Encode, Decode, TypeInfo)]
+pub enum BadgeRarity {
+    Common,
+    Rare,
+    Epic,
+    Legendary,
+}
+
+#[external]
+impl BadgeContract {
+    #[storage]
+    struct Storage {
+        badges: StorageMap<U256, Badge>,
+        player_badges: StorageMap<Address, Vec<U256>>,
+        next_badge_id: U256,
+        badge_uri_base: String,
+    }
+
+    pub fn mint_achievement_badge(
+        &mut self, 
+        recipient: Address, 
+        achievement: String,
+        rarity: BadgeRarity
+    ) -> Result<U256, Error> {
+        self.ensure_authorized()?;
+        
+        let badge_id = self.next_badge_id();
+        let badge = Badge {
+            badge_type: BadgeType::Achievement(achievement.clone()),
+            metadata_uri: self.generate_metadata_uri(badge_id),
+            earned_timestamp: block::timestamp(),
+            rarity,
+        };
+        
+        self.badges.insert(badge_id, badge);
+        
+        // Update player badges
+        let mut player_badges = self.player_badges
+            .get(&recipient)
+            .unwrap_or_default();
+        player_badges.push(badge_id);
+        self.player_badges.insert(recipient, player_badges);
+        
+        self.emit(BadgeMinted {
+            recipient,
+            badge_id,
+            badge_type: "achievement",
+        });
+        
+        Ok(badge_id)
+    }
+
+    pub fn mint_streak_badge(
+        &mut self, 
+        recipient: Address, 
+        streak_days: u32
+    ) -> Result<U256, Error> {
+        self.ensure_authorized()?;
+        
+        // Determine rarity based on streak length
+        let rarity = match streak_days {
+            0..=7 => BadgeRarity::Common,
+            8..=30 => BadgeRarity::Rare,
+            31..=90 => BadgeRarity::Epic,
+            _ => BadgeRarity::Legendary,
+        };
+        
+        let badge_id = self.next_badge_id();
+        let badge = Badge {
+            badge_type: BadgeType::Streak(streak_days),
+            metadata_uri: self.generate_metadata_uri(badge_id),
+            earned_timestamp: block::timestamp(),
+            rarity,
+        };
+        
+        self.mint_badge(recipient, badge_id, badge)
+    }
+
+    pub fn mint_tournament_badge(
+        &mut self, 
+        recipient: Address, 
+        tournament: String,
+        rarity: BadgeRarity
+    ) -> Result<U256, Error> {
+        self.ensure_authorized()?;
+        
+        let badge_id = self.next_badge_id();
+        let badge = Badge {
+            badge_type: BadgeType::Tournament(tournament),
+            metadata_uri: self.generate_metadata_uri(badge_id),
+            earned_timestamp: block::timestamp(),
+            rarity,
+        };
+        
+        self.mint_badge(recipient, badge_id, badge)
+    }
+
+    // Internal helper functions
+    fn mint_badge(
+        &mut self,
+        recipient: Address,
+        badge_id: U256,
+        badge: Badge
+    ) -> Result<U256, Error> {
+        self.badges.insert(badge_id, badge);
+        
+        let mut player_badges = self.player_badges
+            .get(&recipient)
+            .unwrap_or_default();
+        player_badges.push(badge_id);
+        self.player_badges.insert(recipient, player_badges);
+        
+        self._mint(recipient, badge_id)?;
+        
+        Ok(badge_id)
+    }
+
+    fn generate_metadata_uri(&self, badge_id: U256) -> String {
+        format!("{}/{}", self.badge_uri_base, badge_id)
+    }
+
+    // View functions
+    pub fn get_player_badges(&self, player: Address) -> Vec<U256> {
+        self.player_badges.get(&player).unwrap_or_default()
+    }
+
+    pub fn get_badge_details(&self, badge_id: U256) -> Result<Badge, Error> {
+        self.badges.get(&badge_id).ok_or(Error::BadgeNotFound)
+    }
+}
+```
+
+### 5. Achievement Tracker Contract
+```rust
+#[external]
+impl AchievementTrackerContract {
+    #[storage]
+    struct Storage {
+        achievements: StorageMap<String, AchievementCriteria>,
+        player_progress: StorageMap<(Address, String), u32>,
+        badge_contract: Address,
+    }
+
+    pub fn register_achievement(&mut self, 
+        name: String, 
+        criteria: AchievementCriteria
+    ) -> Result<(), Error> {
+        self.ensure_admin()?;
+        self.achievements.insert(name, criteria);
+        Ok(())
+    }
+
+    pub fn update_progress(&mut self, 
+        player: Address, 
+        achievement: String, 
+        progress: u32
+    ) -> Result<(), Error> {
+        self.ensure_authorized()?;
+        
+        let criteria = self.achievements
+            .get(&achievement)
+            .ok_or(Error::AchievementNotFound)?;
+            
+        let current_progress = self.player_progress
+            .get(&(player, achievement.clone()))
+            .unwrap_or_default();
+            
+        let new_progress = current_progress + progress;
+        
+        // Check if achievement is completed
+        if new_progress >= criteria.required_progress 
+            && current_progress < criteria.required_progress {
+            // Mint achievement badge
+            let badge_contract = BadgeContract::new(self.badge_contract);
+            badge_contract.mint_achievement_badge(
+                player,
+                achievement.clone(),
+                criteria.badge_rarity
+            )?;
+        }
+        
+        self.player_progress.insert((player, achievement), new_progress);
+        Ok(())
+    }
+}
+```
+
+### 6. Streak Tracking Contract
+```rust
+#[external]
+impl StreakTrackerContract {
+    #[storage]
+    struct Storage {
+        player_streaks: StorageMap<Address, PlayerStreak>,
+        badge_contract: Address,
+    }
+
+    pub fn check_in(&mut self, player: Address) -> Result<(), Error> {
+        let current_time = block::timestamp();
+        let mut streak = self.player_streaks
+            .get(&player)
+            .unwrap_or_default();
+            
+        if self.is_consecutive_day(streak.last_check_in, current_time) {
+            streak.current_streak += 1;
+            
+            // Check if new streak badge should be minted
+            if self.should_mint_streak_badge(streak.current_streak) {
+                let badge_contract = BadgeContract::new(self.badge_contract);
+                badge_contract.mint_streak_badge(
+                    player,
+                    streak.current_streak
+                )?;
+            }
+        } else {
+            streak.current_streak = 1;
+        }
+        
+        streak.last_check_in = current_time;
+        self.player_streaks.insert(player, streak);
+        Ok(())
+    }
+
+    fn should_mint_streak_badge(&self, streak_days: u32) -> bool {
+        // Mint badges at specific milestones
+        matches!(streak_days, 7 | 30 | 90 | 180 | 365)
+    }
+}
+```
+
+### Integration with Profile Contract
+```rust
+impl ProfileContract {
+    pub fn get_player_achievements(&self, player: Address) -> Vec<Badge> {
+        let badge_contract = BadgeContract::new(self.badge_contract);
+        let badge_ids = badge_contract.get_player_badges(player);
+        
+        badge_ids
+            .iter()
+            .filter_map(|&id| badge_contract.get_badge_details(id).ok())
+            .collect()
+    }
+
+    pub fn get_player_stats(&self, player: Address) -> PlayerStats {
+        let mut stats = PlayerStats::default();
+        
+        // Get badges
+        let badges = self.get_player_achievements(player);
+        
+        // Calculate stats based on badges
+        for badge in badges {
+            match badge.badge_type {
+                BadgeType::Achievement(_) => stats.achievement_count += 1,
+                BadgeType::Streak(days) => stats.longest_streak = stats.longest_streak.max(days),
+                BadgeType::Tournament(_) => stats.tournament_badges += 1,
+                BadgeType::Ranking(_) => stats.ranking_badges += 1,
+                BadgeType::Special(_) => stats.special_badges += 1,
+            }
+        }
+        
+        stats
+    }
+}
+```
+
+### Metadata Generation
+```rust
+impl BadgeContract {
+    fn generate_metadata(&self, badge: &Badge) -> String {
+        let metadata = json!({
+            "name": self.get_badge_name(&badge.badge_type),
+            "description": self.get_badge_description(&badge.badge_type),
+            "image": self.get_badge_image_uri(&badge.badge_type, &badge.rarity),
+            "attributes": [
+                {
+                    "trait_type": "Badge Type",
+                    "value": self.get_badge_type_string(&badge.badge_type)
+                },
+                {
+                    "trait_type": "Rarity",
+                    "value": format!("{:?}", badge.rarity)
+                },
+                {
+                    "trait_type": "Earned Date",
+                    "value": badge.earned_timestamp
+                }
+            ]
+        });
+        
+        serde_json::to_string(&metadata).unwrap_or_default()
+    }
+    
+    fn get_badge_image_uri(
+        &self,
+        badge_type: &BadgeType,
+        rarity: &BadgeRarity
+    ) -> String {
+        format!(
+            "{}/images/{}/{}.png",
+            self.badge_uri_base,
+            self.get_badge_type_string(badge_type).to_lowercase(),
+            format!("{:?}", rarity).to_lowercase()
+        )
+    }
+}
+```
+
+1. Badge NFT Contract with support for different badge types:
+   - Achievement badges
+   - Streak badges
+   - Tournament badges
+   - Ranking badges
+   - Special event badges
+
+2. Achievement Tracker Contract for:
+   - Tracking progress toward achievements
+   - Automatically minting badges when achievements are completed
+   - Managing achievement criteria
+
+3. Streak Tracking Contract for:
+   - Daily check-ins
+   - Streak maintenance
+   - Automatic badge minting at milestones
+
+4. Integration with existing Profile Contract to:
+   - Display player achievements
+   - Calculate stats based on badges
+   - Showcase player progression
+
 ## Implementation Guide
 
 ### 1. Setting Up a New Contract
